@@ -1,4 +1,4 @@
-name: SWU自动签到
+name: SWU自动签到01
 
 # 停用方式：仓库 Actions → 自动签到 → Disable workflow
 # GitHub 官方禁用 workflow 后，定时任务和手动触发都会停止
