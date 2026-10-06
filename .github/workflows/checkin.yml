@@ -8,33 +8,17 @@ name: SWU自动签到01
     # 所以在打卡窗口内布多个"错峰闹钟"；打卡幂等（打过了自动跳过），多跑无害
 on:
   schedule:
-    # 直接使用北京时间，不再手动换算 UTC
-    - cron: '7 21 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 21:07
+    # 北京时间 21:07 ~ 21:57，每10分钟左右尝试一次
+    - cron: '7,17,27,37,47,57 21 * * *'
+      timezone: "Asia/Shanghai"
 
-    - cron: '23 21 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 21:23
+    # 北京时间 22:07 ~ 22:57
+    - cron: '7,17,27,37,47,57 22 * * *'
+      timezone: "Asia/Shanghai"
 
-    - cron: '41 21 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 21:41
-
-    - cron: '57 21 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 21:57
-
-    - cron: '13 22 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 22:13
-
-    - cron: '29 22 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 22:29
-
-    - cron: '47 22 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 22:47
-
-    - cron: '3 23 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 23:03
-
-    - cron: '19 23 * * *'
-      timezone: 'Asia/Shanghai'   # 北京 23:19
+    # 北京时间 23:07、23:17
+    - cron: '7,17 23 * * *'
+      timezone: "Asia/Shanghai"
 
   workflow_dispatch:              # 允许手动触发
 
