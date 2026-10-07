@@ -3,23 +3,14 @@ name: SWU自动签到01
 # 停用方式：仓库 Actions → 自动签到 → Disable workflow
 # GitHub 官方禁用 workflow 后，定时任务和手动触发都会停止
 
-    # 北京时间 21:07 ~ 23:19（UTC 13:07 ~ 15:19），错峰分钟（避开 :00/:15/:30/:45 高峰）
-    # GitHub 定时任务是"尽力而为"，高峰期会延迟几小时甚至直接丢弃（官方文档明示）
-    # 所以在打卡窗口内布多个"错峰闹钟"；打卡幂等（打过了自动跳过），多跑无害
+# 沿用原设计：窗口内错峰、多轮执行；学校接口返回已签到后自动跳过。
+# 不指定 schedule.timezone，以下 cron 明确使用 UTC（北京时间 = UTC + 8）。
+# GitHub 可能延迟或丢弃定时任务；运行时再次检查北京时间，防止迟到至凌晨后提交。
 on:
   schedule:
-    # 北京时间 21:07 ~ 21:57，每10分钟左右尝试一次
-    - cron: '7,17,27,37,47,57 21 * * *'
-      timezone: "Asia/Shanghai"
-
-    # 北京时间 22:07 ~ 22:57
-    - cron: '7,17,27,37,47,57 22 * * *'
-      timezone: "Asia/Shanghai"
-
-    # 北京时间 23:07、23:17
-    - cron: '7,17 23 * * *'
-      timezone: "Asia/Shanghai"
-
+    - cron: '3 13 * * *'   # 北京时间 21:03，提前首轮
+    - cron: '17 13 * * *'  # 北京时间 21:17
+    - cron: '29 13 * * *'  # 北京时间 21:29
   workflow_dispatch:              # 允许手动触发
 
 jobs:
@@ -42,18 +33,50 @@ jobs:
           #   password_secret: SWU_PASSWORD_3
     
     name: 签到 - ${{ matrix.account.name }}
+    # 同一账号串行执行，避免排队延迟导致几轮同时检查并重复提交。
+    concurrency:
+      group: swu-checkin-${{ github.ref }}-${{ matrix.account.name }}
+      cancel-in-progress: false
     
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      - name: 检查定时触发窗口
+        id: schedule_guard
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGER_CRON: ${{ github.event.schedule }}
+        run: |
+          echo "触发方式: $EVENT_NAME"
+          echo "触发 cron (UTC): ${TRIGGER_CRON:-手动触发}"
+          echo "执行时间 (北京时间): $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          allowed=true
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            case "$TRIGGER_CRON" in
+              '3 13 * * *'|'17 13 * * *'|'29 13 * * *') ;;
+              *) allowed=false; echo "::warning::旧定时任务已停用，跳过本次签到" ;;
+            esac
+            beijing_hhmm=$(TZ='Asia/Shanghai' date '+%H%M')
+            if (( 10#$beijing_hhmm < 2100 || 10#$beijing_hhmm >= 2330 )); then
+              allowed=false
+              echo "::warning::定时任务已迟到至 21:00–23:30 签到窗口外，跳过本次签到"
+            fi
+          fi
+          echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
+          if [ "$allowed" = "false" ]; then
+            echo "### ⏭️ 定时任务跳过：旧 cron 或执行时间超出北京时间 21:00–23:30" >> "$GITHUB_STEP_SUMMARY"
+          fi
       
       - name: 设置 Python
+        if: steps.schedule_guard.outputs.allowed == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
           cache: 'pip'
       
       - name: 安装依赖
+        if: steps.schedule_guard.outputs.allowed == 'true'
         run: |
           echo "========================================="
           echo "开始安装依赖..."
@@ -66,6 +89,7 @@ jobs:
       
       - name: 执行签到
         id: checkin
+        if: steps.schedule_guard.outputs.allowed == 'true'
         env:
           SWUDK_USERNAME: ${{ secrets[matrix.account.username_secret] }}
           SWUDK_PASSWORD: ${{ secrets[matrix.account.password_secret] }}
@@ -116,9 +140,13 @@ jobs:
           echo ""
           
           # 提取返回码和消息
-          result_line=$(cat checkin_result.txt | tail -1)
-          status_code=$(echo "$result_line" | grep -oP '\[\K[0-9]+(?=\])')
-          status_msg=$(echo "$result_line" | grep -oP '\] \K.*')
+          result_line=$(tail -n 1 checkin_result.txt)
+          status_code=PARSE_ERROR
+          status_msg="签到结果缺失或格式异常，请查看完整日志"
+          if [[ "$result_line" =~ ^\[([0-5])\][[:space:]]+(.*)$ ]]; then
+            status_code="${BASH_REMATCH[1]}"
+            status_msg="${BASH_REMATCH[2]}"
+          fi
           
           echo "status_code=$status_code" >> $GITHUB_OUTPUT
           echo "status_msg=$status_msg" >> $GITHUB_OUTPUT
@@ -132,7 +160,7 @@ jobs:
           echo "========================================="
           
           # 1=成功, 2=已签到；其余状态已在脚本内重试，仍失败才告警
-          if [ "$status_code" != "1" ] && [ "$status_code" != "2" ]; then
+          if [ "$exit_code" != "0" ] || { [ "$status_code" != "1" ] && [ "$status_code" != "2" ]; }; then
             echo ""
             echo "⚠️  多次重试后仍异常，准备发送通知邮件"
             exit 1
@@ -150,7 +178,7 @@ jobs:
 
       - name: 检查邮件通知配置
         id: mail_config
-        if: always()
+        if: always() && steps.schedule_guard.outputs.allowed == 'true'
         env:
           MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
@@ -162,7 +190,8 @@ jobs:
           missing_vars=()
 
           for variable_name in "${required_vars[@]}"; do
-            if [ -z "${!variable_name:-}" ]; then
+            variable_value="${!variable_name:-}"
+            if [ -z "${variable_value//[[:space:]]/}" ]; then
               missing_vars+=("$variable_name")
             fi
           done
@@ -178,14 +207,33 @@ jobs:
             echo "请进入 GitHub 仓库 Settings → Secrets and variables → Actions，补齐以上 Secret。"
             echo "签到结果仍以本次运行的状态码和 Actions 日志为准。"
           else
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-            echo "missing=" >> "$GITHUB_OUTPUT"
-            echo "✅ 邮件通知配置检查通过"
+            # 非空字符串也可能没有有效收件人；不打印或改写邮箱 Secret。
+            if python - <<'PY'
+          import os
+          import re
+          from email.utils import getaddresses
+
+          addresses = getaddresses([os.environ["NOTIFY_EMAIL"]])
+          valid = bool(addresses) and all(
+              re.fullmatch(r"[^@\s,<>]+@[^@\s,<>]+\.[^@\s,<>]+", address)
+              for _, address in addresses
+          )
+          raise SystemExit(0 if valid else 1)
+          PY
+            then
+              echo "configured=true" >> "$GITHUB_OUTPUT"
+              echo "missing=" >> "$GITHUB_OUTPUT"
+              echo "✅ 邮件通知配置检查通过"
+            else
+              echo "configured=false" >> "$GITHUB_OUTPUT"
+              echo "missing=NOTIFY_EMAIL（收件人格式无效）" >> "$GITHUB_OUTPUT"
+              echo "::warning::NOTIFY_EMAIL 没有有效收件人，跳过邮件通知；签到不受影响"
+            fi
           fi
 
       - name: 发送通知邮件
         id: send_mail
-        if: always() && steps.checkin.outputs.status_code != '1' && steps.checkin.outputs.status_code != '2' && steps.mail_config.outputs.configured == 'true'
+        if: always() && steps.schedule_guard.outputs.allowed == 'true' && steps.checkin.outcome != 'success' && steps.mail_config.outputs.configured == 'true'
         continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
@@ -283,7 +331,7 @@ jobs:
             </html>
 
       - name: 邮件通知结果
-        if: always() && steps.checkin.outputs.status_code != '1' && steps.checkin.outputs.status_code != '2'
+        if: always() && steps.schedule_guard.outputs.allowed == 'true' && steps.checkin.outcome != 'success'
         run: |
           if [ "${{ steps.mail_config.outputs.configured }}" != "true" ]; then
             echo "⚠️ 邮件通知未发送：邮件配置不完整"
@@ -297,17 +345,34 @@ jobs:
 
       - name: 最终状态检查
         if: always()
+        env:
+          ALLOWED: ${{ steps.schedule_guard.outputs.allowed }}
+          STATUS_CODE: ${{ steps.checkin.outputs.status_code }}
+          STATUS_MSG: ${{ steps.checkin.outputs.status_msg }}
+          CHECKIN_EXIT_CODE: ${{ steps.checkin.outputs.exit_code }}
+          CHECKIN_OUTCOME: ${{ steps.checkin.outcome }}
         run: |
           echo ""
           echo "========================================="
           echo "任务执行完成 - ${{ matrix.account.name }}"
           echo "========================================="
-          echo "状态码: ${{ steps.checkin.outputs.status_code }}"
-          echo "状态信息: ${{ steps.checkin.outputs.status_msg }}"
+          echo "状态码: $STATUS_CODE"
+          echo "状态信息: $STATUS_MSG"
+          if [ "$ALLOWED" = "false" ]; then
+            echo "⏭️ 已跳过旧定时任务或窗口外执行；本次未提交签到"
+            exit 0
+          fi
+          {
+            echo "### 签到结果 - ${{ matrix.account.name }}"
+            echo "- 状态码: ${STATUS_CODE:-未取得结果}"
+            echo "- 状态信息: ${STATUS_MSG:-请查看安装依赖和签到步骤日志}"
+            echo "- 签到进程退出码: ${CHECKIN_EXIT_CODE:-未执行}"
+            echo "- 邮件通知结果: ${{ steps.send_mail.outcome }}（独立于签到结果）"
+          } >> "$GITHUB_STEP_SUMMARY"
           
-          if [ "${{ steps.checkin.outputs.status_code }}" = "1" ]; then
+          if [ "$CHECKIN_OUTCOME" = "success" ] && [ "$CHECKIN_EXIT_CODE" = "0" ] && [ "$STATUS_CODE" = "1" ]; then
             echo "✅ 签到成功"
-          elif [ "${{ steps.checkin.outputs.status_code }}" = "2" ]; then
+          elif [ "$CHECKIN_OUTCOME" = "success" ] && [ "$CHECKIN_EXIT_CODE" = "0" ] && [ "$STATUS_CODE" = "2" ]; then
             echo "✅ 已签到，无需重复"
           else
             echo "⚠️ 签到任务异常"
@@ -318,5 +383,7 @@ jobs:
             else
               echo "⚠️ 邮件通知发送失败，请检查 SMTP 配置"
             fi
+            echo "❌ 本次签到未确认成功，Actions 必须标记失败"
+            exit 1
           fi
           echo "========================================="
