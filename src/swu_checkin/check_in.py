@@ -238,7 +238,7 @@ def check_in_with_retry(
 def main() -> int:
     username = os.getenv("SWUDK_USERNAME") or input("校园网账号：").strip()
     password = os.getenv("SWUDK_PASSWORD") or getpass("校园网密码：")
-    result = check_in_with_retry(username, password, 10)
+    result = check_in_with_retry(username, password, _env_int("SWUDK_REQUEST_TIMEOUT", 10))
     print(f"[{result}] {STATUS_MESSAGES.get(result, '未知状态')}")
     return 0 if result in {1, 2} else 1
 
