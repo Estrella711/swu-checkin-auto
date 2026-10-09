@@ -11,7 +11,7 @@
 - ✅ 支持请假状态检测
 - ✅ 防重复打卡
 - ✅ 详细状态码返回
-- ✅ GitHub Actions 定时任务
+- ✅ GitHub Actions 提前启动，签到窗口内持续重试
 - ✅ 瞬时失败自动重试（多次失败才算失败）
 - ✅ 失败邮件通知
 
@@ -22,13 +22,16 @@
 
 ## 快速开始
 
-### 方式一：GitHub Actions 自动签到（推荐）
+### 方式一：GitHub Actions 自动签到
 
-无需本地环境，全自动云端执行：
+无需本地环境，通过云端执行：
 
 1. Fork 本仓库到你的账号
-2. 在仓库 **Settings** → **Secrets** 中配置账号密码
-3. 每天北京时间 21:03、21:17、21:29 错峰自动签到（GitHub Actions 可能有延迟；已签到后跳过）
+2. 在仓库 **Settings** → **Secrets and variables** → **Actions** 中配置账号密码及邮件 Secrets
+3. 启用工作流：每天北京时间 20:43 提前启动并准备环境，等待至 21:01 开始签到；21:17、22:17、23:07 设置补救触发
+4. 定时程序在窗口内每隔 300 秒继续尝试，成功或已签到后结束；23:25 停止尝试，为 23:30 结束前的异常通知留出 5 分钟
+
+GitHub 的定时事件可能延迟或丢弃，以上时间是计划触发时间。若要求每天按时启动，必须另配独立的外部定时源；工作流提供 `scheduled=true` 的 API 触发入口。完全没有启动的工作流无法自行发送失败邮件。定时启动迟到、截止仍未确认签到成功时，已启动的工作流会尝试发送失败邮件并显示失败。详见配置教程中的调度限制与外部触发说明。
 
 **详细配置教程**: [GITHUB_ACTIONS.md](GITHUB_ACTIONS.md)
 
@@ -61,7 +64,8 @@ swu-checkin
 from swu_checkin import check_in
 
 # 从环境变量读取账号密码
-check_in()
+import os
+result = check_in(os.environ["SWUDK_USERNAME"], os.environ["SWUDK_PASSWORD"])
 ```
 
 ##### Windows PowerShell
@@ -102,6 +106,7 @@ swu-checkin
 │   └── swu_checkin/
 │       ├── __init__.py
 │       ├── check_in.py       # 主打卡脚本
+│       ├── scheduled.py      # 等待签到窗口、持续重试及截止检查
 │       ├── get_info.py       # 信息获取模块
 │       ├── verify.py         # 登录验证模块
 │       ├── identity.py       # 身份选择处理
@@ -126,6 +131,8 @@ swu-checkin
 - ⚠️ 建议在正式使用前先手动测试一次
 - ⚠️ 网络异常、验证码识别失败、今日任务暂未生成时会自动重试 3 次，打满才算失败
 - ⚠️ 可用环境变量 `SWUDK_MAX_ATTEMPTS`、`SWUDK_RETRY_DELAY` 调整重试次数和等待秒数
+- ⚠️ Actions 默认手动运行仍立即执行；勾选 `scheduled` 才使用签到窗口及持续重试，勾选 `notify_test` 可单独验证失败邮件而不访问学校接口
+- ⚠️ 定时任务按北京时间 21:00–23:30 的学校窗口检查，实际新尝试截止为 23:25；不要把 Actions 绿色状态当作学校端已签到的唯一凭据
 - ⚠️ GitHub Actions 使用 Secrets 存储敏感信息，安全可靠
 
 ## 相关项目
