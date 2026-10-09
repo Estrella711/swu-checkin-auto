@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from getpass import getpass
 import json
 import os
@@ -22,6 +22,27 @@ STATUS_MESSAGES = {
 RETRYABLE_STATUS = {0, 3, 4}
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY = 8
+CHINA = timezone(timedelta(hours=8))
+
+
+def _beijing_now() -> datetime:
+    return datetime.now(CHINA)
+
+
+def _request_timeout_in_window(timeout: int, now: datetime) -> int | float | None:
+    """定时任务只在当日 21:00–23:25 提交，预留失败邮件发送时间。"""
+    if os.getenv("SWUDK_ENFORCE_WINDOW") != "1":
+        return timeout
+
+    target_date = os.getenv("SWUDK_TARGET_DATE", "").strip()
+    if target_date and now.date().isoformat() != target_date:
+        return None
+
+    start = now.replace(hour=21, minute=0, second=0, microsecond=0)
+    deadline = now.replace(hour=23, minute=25, second=0, microsecond=0)
+    if not start <= now < deadline:
+        return None
+    return min(timeout, (deadline - now).total_seconds())
 
 
 def _env_int(name: str, default: int) -> int:
@@ -52,9 +73,9 @@ def _check_vacation_enabled(token: str, timeout: int) -> bool:
         if latest.get("lcztmc") != "已同意":
             return False
         
-        now = datetime.now()
-        start = datetime.strptime(latest["kssj"], "%Y-%m-%d %H:%M")
-        end = datetime.strptime(latest["jssj"], "%Y-%m-%d %H:%M")
+        now = _beijing_now()
+        start = datetime.strptime(latest["kssj"], "%Y-%m-%d %H:%M").replace(tzinfo=CHINA)
+        end = datetime.strptime(latest["jssj"], "%Y-%m-%d %H:%M").replace(tzinfo=CHINA)
         
         return start <= now <= end
     except (requests.exceptions.RequestException, KeyError, ValueError):
@@ -94,15 +115,17 @@ def _parse_dormitory_data(dormitory_list: list) -> tuple[dict, str, str]:
     return location, building, room
 
 
-def _submit_checkin(token: str, timeout: int) -> int:
+def _submit_checkin(token: str, timeout: int) -> int | None:
     """
     执行签到请求
-    返回: 1=成功, 4=网络错误, None=无今日记录
+    返回: 1=已确认成功, 2=已签到, 4=网络或状态异常, None=无今日记录
     """
     try:
         transition = get_transition_today(token, timeout)
         if transition is None:
             return None
+        if transition.get("qdzt") == "已签到":
+            return 2
         
         form_id = transition["formId"]
         record_id = transition["id"]
@@ -111,6 +134,7 @@ def _submit_checkin(token: str, timeout: int) -> int:
         dorm_response = get_dormitory(token, timeout)
         column_list = dorm_response.get("data", {}).get("columnList", [])
         location, building, room = _parse_dormitory_data(column_list)
+        student_id = get_student_id(token, timeout)
         
         headers = {
             "fighter-auth-token": token,
@@ -122,8 +146,8 @@ def _submit_checkin(token: str, timeout: int) -> int:
         payload = {
             "id": record_id,
             "formId": form_id,
-            "tsrq": time.strftime("%Y-%m-%d"),
-            "xh": get_student_id(token, timeout),
+            "tsrq": _beijing_now().date().isoformat(),
+            "xh": student_id,
             "qdsj": ["21:00", "23:30"],
             "qsqddd": building,
             "qdbj": room,
@@ -148,15 +172,21 @@ def _submit_checkin(token: str, timeout: int) -> int:
             }
         }
         
+        data = json.dumps(payload)
+        post_timeout = _request_timeout_in_window(timeout, _beijing_now())
+        if post_timeout is None:
+            return 4
+
         response = requests.post(
             url,
             headers=headers,
             params=params,
-            data=json.dumps(payload),
-            timeout=timeout
+            data=data,
+            timeout=post_timeout
         )
         response.raise_for_status()
-        return 1
+        confirmed = get_transition_today(token, timeout)
+        return 1 if confirmed and confirmed.get("qdzt") == "已签到" else 4
         
     except requests.exceptions.RequestException:
         return 4
@@ -177,6 +207,9 @@ def check_in(username: str, password: str, timeout: int = 10) -> int:
         5: 请假期间无需签到
     """
     try:
+        if _request_timeout_in_window(timeout, _beijing_now()) is None:
+            return 4
+
         token = get_token(username, password, timeout)
         if not token:
             return 3

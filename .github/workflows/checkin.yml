@@ -3,19 +3,34 @@ name: SWU自动签到01
 # 停用方式：仓库 Actions → 自动签到 → Disable workflow
 # GitHub 官方禁用 workflow 后，定时任务和手动触发都会停止
 
-# 沿用原设计：窗口内错峰、多轮执行；学校接口返回已签到后自动跳过。
-# 不指定 schedule.timezone，以下 cron 明确使用 UTC（北京时间 = UTC + 8）。
-# GitHub 可能延迟或丢弃定时任务；运行时再次检查北京时间，防止迟到至凌晨后提交。
+# 提前准备环境，窗口内持续重试；以下 cron 使用 UTC（北京时间 = UTC + 8）。
+# GitHub 定时事件可能延迟或丢弃；迟到任务必须告警，不能显示签到成功。
 on:
   schedule:
-    - cron: '3 13 * * *'   # 北京时间 21:03，提前首轮
-    - cron: '17 13 * * *'  # 北京时间 21:17
-    - cron: '29 13 * * *'  # 北京时间 21:29
-  workflow_dispatch:              # 允许手动触发
+    - cron: '43 12 * * *'  # 北京时间 20:43，预热后等待 21:01
+    - cron: '17 13 * * *'  # 北京时间 21:17，补跑
+    - cron: '17 14 * * *'  # 北京时间 22:17，补跑
+    - cron: '7 15 * * *'   # 北京时间 23:07，补跑
+  repository_dispatch:
+    types: [swu-checkin]
+  workflow_dispatch:
+    inputs:
+      scheduled:
+        description: '按北京时间窗口持续重试（默认保留原手动打卡）'
+        type: boolean
+        default: false
+      notify_test:
+        description: '仅测试失败邮件通知，不调用学校接口'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
     strategy:
       # 多账号并行执行，失败不影响其他账号
       fail-fast: false
@@ -35,7 +50,7 @@ jobs:
     name: 签到 - ${{ matrix.account.name }}
     # 同一账号串行执行，避免排队延迟导致几轮同时检查并重复提交。
     concurrency:
-      group: swu-checkin-${{ github.ref }}-${{ matrix.account.name }}
+      group: swu-checkin-${{ matrix.account.username_secret }}
       cancel-in-progress: false
     
     steps:
@@ -47,29 +62,38 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           TRIGGER_CRON: ${{ github.event.schedule }}
+          SCHEDULED_INPUT: ${{ inputs.scheduled }}
+          NOTIFY_TEST: ${{ inputs.notify_test }}
         run: |
           echo "触发方式: $EVENT_NAME"
           echo "触发 cron (UTC): ${TRIGGER_CRON:-手动触发}"
           echo "执行时间 (北京时间): $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           allowed=true
-          if [ "$EVENT_NAME" = "schedule" ]; then
-            case "$TRIGGER_CRON" in
-              '3 13 * * *'|'17 13 * * *'|'29 13 * * *') ;;
-              *) allowed=false; echo "::warning::旧定时任务已停用，跳过本次签到" ;;
-            esac
+          automatic=false
+          reason=""
+          if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "repository_dispatch" ] || [ "$SCHEDULED_INPUT" = "true" ]; then
+            automatic=true
             beijing_hhmm=$(TZ='Asia/Shanghai' date '+%H%M')
-            if (( 10#$beijing_hhmm < 2100 || 10#$beijing_hhmm >= 2330 )); then
+            if (( 10#$beijing_hhmm < 2040 || 10#$beijing_hhmm >= 2325 )); then
               allowed=false
-              echo "::warning::定时任务已迟到至 21:00–23:30 签到窗口外，跳过本次签到"
+              reason="自动任务启动超出北京时间 20:40–23:25，本次未能确认签到"
             fi
           fi
+          if [ "$NOTIFY_TEST" = "true" ]; then
+            allowed=false
+            reason="邮件通知测试：未调用学校接口"
+          fi
           echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
+          echo "automatic=$automatic" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
           if [ "$allowed" = "false" ]; then
-            echo "### ⏭️ 定时任务跳过：旧 cron 或执行时间超出北京时间 21:00–23:30" >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::$reason"
+            echo "### ⚠️ $reason" >> "$GITHUB_STEP_SUMMARY"
           fi
       
       - name: 设置 Python
         if: steps.schedule_guard.outputs.allowed == 'true'
+        timeout-minutes: 10
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -77,6 +101,7 @@ jobs:
       
       - name: 安装依赖
         if: steps.schedule_guard.outputs.allowed == 'true'
+        timeout-minutes: 10
         run: |
           echo "========================================="
           echo "开始安装依赖..."
@@ -98,6 +123,8 @@ jobs:
           SWUDK_RETRY_DELAY: "8"
           # 晚间实际日志出现 ReadTimeout；给任务/宿舍接口 30 秒读取时间。
           SWUDK_REQUEST_TIMEOUT: "30"
+          SWUDK_POLL_INTERVAL: "300"
+          AUTOMATIC: ${{ steps.schedule_guard.outputs.automatic }}
           # 只记录接口状态/耗时/异常类型，不记录查询参数、凭据、请求或响应内容。
           PYTHONPATH: ${{ github.workspace }}/.github/diagnostics
         run: |
@@ -132,7 +159,11 @@ jobs:
           
           # main() 对签到异常状态返回 1；关闭 errexit，确保仍能读取并解析结果
           set +e
-          python -m swu_checkin.check_in > checkin_result.txt 2>&1
+          if [ "$AUTOMATIC" = "true" ]; then
+            python -u src/swu_checkin/scheduled.py > checkin_result.txt 2>&1
+          else
+            python -m swu_checkin.check_in > checkin_result.txt 2>&1
+          fi
           exit_code=$?
           set -e
           
@@ -182,7 +213,8 @@ jobs:
 
       - name: 检查邮件通知配置
         id: mail_config
-        if: always() && steps.schedule_guard.outputs.allowed == 'true'
+        if: always() && steps.checkin.outcome != 'success'
+        timeout-minutes: 1
         env:
           MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
@@ -237,7 +269,8 @@ jobs:
 
       - name: 发送通知邮件
         id: send_mail
-        if: always() && steps.schedule_guard.outputs.allowed == 'true' && steps.checkin.outcome != 'success' && steps.mail_config.outputs.configured == 'true'
+        if: always() && steps.checkin.outcome != 'success' && steps.mail_config.outputs.configured == 'true'
+        timeout-minutes: 2
         continue-on-error: true
         uses: dawidd6/action-send-mail@v3
         with:
@@ -245,7 +278,7 @@ jobs:
           server_port: ${{ secrets.MAIL_PORT }}
           username: ${{ secrets.MAIL_USERNAME }}
           password: ${{ secrets.MAIL_PASSWORD }}
-          subject: '⚠️ SWU 查寝打卡｜${{ matrix.account.name }}｜${{ steps.checkin.outputs.status_msg }}'
+          subject: '⚠️ SWU 查寝打卡｜${{ matrix.account.name }}｜${{ steps.checkin.outputs.status_msg || steps.schedule_guard.outputs.reason || ''执行步骤失败'' }}'
           to: ${{ secrets.NOTIFY_EMAIL }}
           from: ${{ secrets.MAIL_USERNAME }}
           body: |
@@ -255,12 +288,14 @@ jobs:
             ====================
 
             账号：${{ matrix.account.name }}
-            状态码：${{ steps.checkin.outputs.status_code }}
-            状态信息：${{ steps.checkin.outputs.status_msg }}
+            状态码：${{ steps.checkin.outputs.status_code || 'NOT_CONFIRMED' }}
+            状态信息：${{ steps.checkin.outputs.status_msg || steps.schedule_guard.outputs.reason || '执行步骤失败，请查看日志' }}
             执行时间：${{ steps.format_time.outputs.beijing_time }} (北京时间)
 
-            本次脚本已完成自动重试。完整结果：
-            ${{ steps.checkin.outputs.full_result }}
+            本次运行未能确认签到成功（先前运行可能已经成功）。
+            定时任务在窗口内重试，23:25 停止并预留通知时间；启动迟到或环境准备失败也会通知。
+            完整结果：
+            ${{ steps.checkin.outputs.full_result || steps.schedule_guard.outputs.reason || '未取得打卡结果' }}
 
             状态码说明：
             [0] 今日无签到记录
@@ -304,16 +339,16 @@ jobs:
                             </tr>
                             <tr>
                               <td style="padding:0 0 12px;color:#64748b;font-size:13px;">状态码</td>
-                              <td style="padding:0 0 12px;color:#0f172a;font-size:14px;font-weight:600;">${{ steps.checkin.outputs.status_code }}</td>
+                              <td style="padding:0 0 12px;color:#0f172a;font-size:14px;font-weight:600;">${{ steps.checkin.outputs.status_code || 'NOT_CONFIRMED' }}</td>
                             </tr>
                             <tr>
                               <td style="padding:0;color:#64748b;font-size:13px;">状态信息</td>
-                              <td style="padding:0;color:#0f172a;font-size:14px;font-weight:600;">${{ steps.checkin.outputs.status_msg }}</td>
+                              <td style="padding:0;color:#0f172a;font-size:14px;font-weight:600;">${{ steps.checkin.outputs.status_msg || steps.schedule_guard.outputs.reason || '执行步骤失败，请查看日志' }}</td>
                             </tr>
                           </table>
 
                           <div style="padding:16px;border-radius:8px;background:#eff6ff;border:1px solid #dbeafe;color:#1e3a8a;font-size:14px;line-height:1.75;">
-                              脚本已完成自动重试。详细日志请点击下方按钮查看。
+                              本次运行未能确认签到成功。启动迟到或环境准备失败也会通知；先前运行可能已经成功。详细日志请点击下方按钮查看。
                           </div>
 
                           <div style="margin-top:24px;text-align:center;">
@@ -335,7 +370,7 @@ jobs:
             </html>
 
       - name: 邮件通知结果
-        if: always() && steps.schedule_guard.outputs.allowed == 'true' && steps.checkin.outcome != 'success'
+        if: always() && steps.checkin.outcome != 'success'
         run: |
           if [ "${{ steps.mail_config.outputs.configured }}" != "true" ]; then
             echo "⚠️ 邮件通知未发送：邮件配置不完整"
@@ -351,10 +386,11 @@ jobs:
         if: always()
         env:
           ALLOWED: ${{ steps.schedule_guard.outputs.allowed }}
-          STATUS_CODE: ${{ steps.checkin.outputs.status_code }}
-          STATUS_MSG: ${{ steps.checkin.outputs.status_msg }}
+          STATUS_CODE: ${{ steps.checkin.outputs.status_code || 'NOT_CONFIRMED' }}
+          STATUS_MSG: ${{ steps.checkin.outputs.status_msg || steps.schedule_guard.outputs.reason || '未取得打卡结果' }}
           CHECKIN_EXIT_CODE: ${{ steps.checkin.outputs.exit_code }}
           CHECKIN_OUTCOME: ${{ steps.checkin.outcome }}
+          GUARD_REASON: ${{ steps.schedule_guard.outputs.reason }}
         run: |
           echo ""
           echo "========================================="
@@ -363,8 +399,7 @@ jobs:
           echo "状态码: $STATUS_CODE"
           echo "状态信息: $STATUS_MSG"
           if [ "$ALLOWED" = "false" ]; then
-            echo "⏭️ 已跳过旧定时任务或窗口外执行；本次未提交签到"
-            exit 0
+            echo "⚠️ $GUARD_REASON"
           fi
           {
             echo "### 签到结果 - ${{ matrix.account.name }}"
