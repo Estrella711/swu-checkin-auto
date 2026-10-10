@@ -105,9 +105,9 @@ class CheckInTests(unittest.TestCase):
     def test_window_start_is_inclusive_and_stop_is_exclusive(self):
         self.enforce_window()
         self.assertEqual(checkin._request_timeout_in_window(10, self.current), 10)
-        last_moment = self.current.replace(hour=23, minute=24, second=59, microsecond=500000)
+        last_moment = self.current.replace(hour=22, minute=54, second=59, microsecond=500000)
         self.assertEqual(checkin._request_timeout_in_window(10, last_moment), 0.5)
-        for hour, minute, second in ((20, 59, 59), (23, 25, 0), (23, 30, 0), (0, 0, 0)):
+        for hour, minute, second in ((20, 59, 59), (22, 55, 0), (23, 0, 0), (0, 0, 0)):
             with self.subTest(hour=hour, minute=minute, second=second):
                 self.current = self.current.replace(hour=hour, minute=minute, second=second)
                 self.assertEqual(self.run_checkin(), 4)
@@ -115,6 +115,17 @@ class CheckInTests(unittest.TestCase):
                 self.get.assert_not_called()
                 self.transition.assert_not_called()
                 self.post.assert_not_called()
+
+    def test_scheduled_checkin_at_2300_rejects_without_any_api_calls(self):
+        self.enforce_window()
+        self.current = self.current.replace(hour=23, minute=0)
+        self.assertEqual(self.run_checkin(), 4)
+        self.token.assert_not_called()
+        self.get.assert_not_called()
+        self.transition.assert_not_called()
+        self.dorm.assert_not_called()
+        self.student.assert_not_called()
+        self.post.assert_not_called()
 
     def test_target_date_prevents_next_day_submission(self):
         self.enforce_window()
@@ -125,7 +136,7 @@ class CheckInTests(unittest.TestCase):
 
     def test_login_crossing_cutoff_never_saves(self):
         self.enforce_window()
-        self.current = self.current.replace(hour=23, minute=24, second=59)
+        self.current = self.current.replace(hour=22, minute=54, second=59)
 
         def slow_login(*_args):
             self.current += timedelta(seconds=2)
@@ -150,7 +161,7 @@ class CheckInTests(unittest.TestCase):
 
     def test_slow_dormitory_lookup_crossing_cutoff_never_saves(self):
         self.enforce_window()
-        self.current = self.current.replace(hour=23, minute=24, second=59)
+        self.current = self.current.replace(hour=22, minute=54, second=59)
         dormitory = self.dorm.return_value
 
         def slow_dormitory(*_args):
@@ -164,7 +175,7 @@ class CheckInTests(unittest.TestCase):
 
     def test_post_timeout_is_capped_by_remaining_window(self):
         self.enforce_window()
-        self.current = self.current.replace(hour=23, minute=24, second=58, microsecond=500000)
+        self.current = self.current.replace(hour=22, minute=54, second=58, microsecond=500000)
         self.assertEqual(self.run_checkin(), 1)
         self.assertEqual(self.post.call_args.kwargs["timeout"], 1.5)
 

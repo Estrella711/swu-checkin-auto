@@ -3,14 +3,18 @@ name: SWU自动签到01
 # 停用方式：仓库 Actions → 自动签到 → Disable workflow
 # GitHub 官方禁用 workflow 后，定时任务和手动触发都会停止
 
-# 提前准备环境，窗口内持续重试；以下 cron 使用 UTC（北京时间 = UTC + 8）。
-# GitHub 定时事件可能延迟或丢弃；迟到任务必须告警，不能显示签到成功。
+# 全部计划直接使用北京时间。首次下午启动，容忍已观察到的约 5 小时调度延迟。
+# 下午任务仅等待；自动打卡只在晚上 21:00–23:00 的执行范围内调用学校接口。
 on:
   schedule:
-    - cron: '43 12 * * *'  # 北京时间 20:43，预热后等待 21:01
-    - cron: '17 13 * * *'  # 北京时间 21:17，补跑
-    - cron: '17 14 * * *'  # 北京时间 22:17，补跑
-    - cron: '7 15 * * *'   # 北京时间 23:07，补跑
+    - cron: '43 15 * * *'  # 下午预备，等待到 20:50；正式签到从 21:01 开始
+      timezone: Asia/Shanghai
+    - cron: '17 21 * * *'  # 北京时间 21:17，补跑
+      timezone: Asia/Shanghai
+    - cron: '17 22 * * *'  # 北京时间 22:17，补跑
+      timezone: Asia/Shanghai
+    - cron: '47 22 * * *'  # 北京时间 22:47，补跑
+      timezone: Asia/Shanghai
   repository_dispatch:
     types: [swu-checkin]
   workflow_dispatch:
@@ -28,7 +32,25 @@ permissions:
   contents: read
 
 jobs:
+  prewarm:
+    name: 提前准备（21:00 前不打卡）
+    if: github.event_name == 'schedule' && github.event.schedule == '43 15 * * *'
+    runs-on: ubuntu-latest
+    # 独立任务的上限低于 GitHub 每个执行器任务 6 小时的限制。
+    timeout-minutes: 330
+    outputs:
+      target_date: ${{ steps.wait_window.outputs.target_date }}
+    steps:
+      - name: 检出等待程序
+        uses: actions/checkout@v4
+      - name: 等待到北京时间 20:50
+        id: wait_window
+        run: python -u src/swu_checkin/prewarm.py
+
   checkin:
+    needs: prewarm
+    # 晚间补跑和手动运行跳过 prewarm；预备失败仍进入原邮件通知流程。
+    if: always() && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -64,9 +86,12 @@ jobs:
           TRIGGER_CRON: ${{ github.event.schedule }}
           SCHEDULED_INPUT: ${{ inputs.scheduled }}
           NOTIFY_TEST: ${{ inputs.notify_test }}
+          PREWARM_RESULT: ${{ needs.prewarm.result }}
+          PREWARM_TARGET_DATE: ${{ needs.prewarm.outputs.target_date }}
         run: |
           echo "触发方式: $EVENT_NAME"
-          echo "触发 cron (UTC): ${TRIGGER_CRON:-手动触发}"
+          echo "触发 cron: ${TRIGGER_CRON:-手动触发}"
+          echo "当前定时配置时区: Asia/Shanghai"
           echo "执行时间 (北京时间): $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           allowed=true
           automatic=false
@@ -74,10 +99,18 @@ jobs:
           if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "repository_dispatch" ] || [ "$SCHEDULED_INPUT" = "true" ]; then
             automatic=true
             beijing_hhmm=$(TZ='Asia/Shanghai' date '+%H%M')
-            if (( 10#$beijing_hhmm < 2040 || 10#$beijing_hhmm >= 2325 )); then
+            if (( 10#$beijing_hhmm < 2040 || 10#$beijing_hhmm >= 2255 )); then
               allowed=false
-              reason="自动任务启动超出北京时间 20:40–23:25，本次未能确认签到"
+              reason="自动任务启动超出北京时间 20:40–22:55，本次未能确认签到"
             fi
+          fi
+          if [ "$PREWARM_RESULT" = "failure" ]; then
+            allowed=false
+            reason="提前准备任务失败，本次未能确认签到"
+          fi
+          if [ -n "$PREWARM_TARGET_DATE" ] && [ "$PREWARM_TARGET_DATE" != "$(TZ='Asia/Shanghai' date '+%Y-%m-%d')" ]; then
+            allowed=false
+            reason="提前准备与签到执行不在同一北京时间日期，未提交签到"
           fi
           if [ "$NOTIFY_TEST" = "true" ]; then
             allowed=false
@@ -293,7 +326,7 @@ jobs:
             执行时间：${{ steps.format_time.outputs.beijing_time }} (北京时间)
 
             本次运行未能确认签到成功（先前运行可能已经成功）。
-            定时任务在窗口内重试，23:25 停止并预留通知时间；启动迟到或环境准备失败也会通知。
+            定时任务在 21:00–23:00 范围内执行，22:55 停止并预留通知时间；启动迟到或环境准备失败也会通知。
             完整结果：
             ${{ steps.checkin.outputs.full_result || steps.schedule_guard.outputs.reason || '未取得打卡结果' }}
 
