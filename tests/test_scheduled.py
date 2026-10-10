@@ -91,7 +91,7 @@ class ScheduledTests(unittest.TestCase):
                 self.assertTrue(self.logs[-1].startswith("[4] "))
 
     def test_early_and_late_starts_fail_instead_of_skipping_green(self):
-        for hour, minute in ((20, 39), (23, 25), (23, 30), (0, 0), (12, 0)):
+        for hour, minute in ((20, 39), (22, 55), (23, 0), (0, 0), (12, 0)):
             with self.subTest(hour=hour, minute=minute):
                 runner = Mock()
                 self.assertEqual(self.run_scheduler(Clock(hour, minute), runner), 1)
@@ -99,17 +99,18 @@ class ScheduledTests(unittest.TestCase):
                 self.assertTrue(self.logs[-1].startswith("[4] "))
 
     def test_deadline_caps_timeout_and_wait_and_never_starts_new_child(self):
-        clock = Clock(23, 24, 30)
+        clock = Clock(22, 54, 30)
         runner = Mock(return_value=child(0, 1))
         self.assertEqual(self.run_scheduler(clock, runner), 1)
         self.assertEqual(runner.call_count, 1)
         self.assertEqual(runner.call_args.kwargs["timeout"], 30)
         self.assertEqual(clock.sleeps, [30])
-        self.assertEqual(clock.current.minute, 25)
+        self.assertEqual(clock.current.hour, 22)
+        self.assertEqual(clock.current.minute, 55)
         self.assertTrue(self.logs[-1].startswith("[4] "))
 
     def test_success_after_deadline_does_not_return_green(self):
-        clock = Clock(23, 24, 59)
+        clock = Clock(22, 54, 59)
 
         def runner(*args, **kwargs):
             clock.current += timedelta(seconds=2)
@@ -156,7 +157,7 @@ class ScheduledTests(unittest.TestCase):
         self.assertIn("本轮签到超时，等待下一轮", self.logs)
 
     def test_missing_final_result_cannot_use_an_earlier_success_line(self):
-        clock = Clock(23, 24, 59)
+        clock = Clock(22, 54, 59)
         runner = Mock(return_value=child(stdout="[1] 签到成功\nTraceback: failed\n"))
         self.assertEqual(self.run_scheduler(clock, runner), 1)
         self.assertEqual(runner.call_count, 1)

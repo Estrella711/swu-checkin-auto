@@ -1,0 +1,22 @@
+name: 自动打卡时间逻辑测试
+
+on:
+  push:
+    branches: [main, 'fix/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  time_logic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: 验证北京时间、提前等待、截止与失败重试
+        run: python -m unittest discover -s tests -v

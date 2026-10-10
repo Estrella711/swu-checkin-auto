@@ -30,7 +30,7 @@ def _beijing_now() -> datetime:
 
 
 def _request_timeout_in_window(timeout: int, now: datetime) -> int | float | None:
-    """定时任务只在当日 21:00–23:25 提交，预留失败邮件发送时间。"""
+    """定时任务只在当日 21:00–22:55 提交，预留 23:00 前的失败邮件发送时间。"""
     if os.getenv("SWUDK_ENFORCE_WINDOW") != "1":
         return timeout
 
@@ -39,7 +39,7 @@ def _request_timeout_in_window(timeout: int, now: datetime) -> int | float | Non
         return None
 
     start = now.replace(hour=21, minute=0, second=0, microsecond=0)
-    deadline = now.replace(hour=23, minute=25, second=0, microsecond=0)
+    deadline = now.replace(hour=22, minute=55, second=0, microsecond=0)
     if not start <= now < deadline:
         return None
     return min(timeout, (deadline - now).total_seconds())

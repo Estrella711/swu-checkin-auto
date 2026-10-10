@@ -95,7 +95,7 @@ def run_scheduled(
     env: Mapping[str, str] | None = None,
     emit: Callable[[str], None] = print,
 ) -> int:
-    """Wait for 21:01, then retry through 23:25 on the captured Beijing date.
+    """Wait for 21:01, then retry through 22:55 on the captured Beijing date.
 
     Both late starts and unconfirmed outcomes fail, allowing the workflow to
     send its existing failure email. Status 5 keeps the workflow's leave alert
@@ -113,9 +113,9 @@ def run_scheduled(
     started = _as_beijing(now())
     earliest = started.replace(hour=20, minute=40, second=0, microsecond=0)
     first_attempt = started.replace(hour=21, minute=1, second=0, microsecond=0)
-    deadline = started.replace(hour=23, minute=25, second=0, microsecond=0)
+    deadline = started.replace(hour=22, minute=55, second=0, microsecond=0)
     if started < earliest or started >= deadline:
-        return _finish(4, "定时任务未在北京时间 20:40–23:25 启动，未提交签到", emit)
+        return _finish(4, "定时任务未在北京时间 20:40–22:55 启动，未提交签到", emit)
 
     emit(f"北京时间 {started:%Y-%m-%d %H:%M:%S} 启动，签到确认截止 {deadline:%H:%M}")
     if started < first_attempt:
@@ -135,7 +135,7 @@ def run_scheduled(
     while True:
         remaining = (deadline - _as_beijing(now())).total_seconds()
         if remaining <= 0:
-            return _finish(4, f"截至北京时间 23:25 未确认签到成功（{last_reason}）", emit)
+            return _finish(4, f"截至北京时间 22:55 未确认签到成功（{last_reason}）", emit)
 
         attempt += 1
         emit(f"第 {attempt} 轮签到，北京时间 {_as_beijing(now()):%H:%M:%S}")
@@ -175,7 +175,7 @@ def run_scheduled(
         # Never report success for a previous date or outside this deadline.
         current = _as_beijing(now())
         if current >= deadline:
-            return _finish(4, f"截至北京时间 23:25 未及时确认签到成功（{last_reason}）", emit)
+            return _finish(4, f"截至北京时间 22:55 未及时确认签到成功（{last_reason}）", emit)
         if status in {1, 2} and returncode == 0:
             return _finish(status, STATUS_MESSAGES[status], emit)
         if status == 5:
