@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 BEIJING = timezone(timedelta(hours=8), "Asia/Shanghai")
 DEFAULT_POLL_INTERVAL = 300
@@ -103,6 +103,17 @@ def run_scheduled(
     so tests never contact the school or wait for a real evening.
     """
     child_env = dict(os.environ if env is None else env)
+    started = _as_beijing(now())
+    target_date = child_env.get("SWUDK_TARGET_DATE", started.date().isoformat())
+    if not isinstance(target_date, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", target_date) is None:
+        return _finish(4, "SWUDK_TARGET_DATE 必须是有效的 YYYY-MM-DD 日期，未提交签到", emit)
+    try:
+        target_day = date.fromisoformat(target_date)
+    except ValueError:
+        return _finish(4, "SWUDK_TARGET_DATE 必须是有效的 YYYY-MM-DD 日期，未提交签到", emit)
+    if target_day != started.date():
+        return _finish(4, "SWUDK_TARGET_DATE 与当前北京时间日期不符，未提交签到", emit)
+
     try:
         interval = _poll_interval(
             child_env.get("SWUDK_POLL_INTERVAL") if poll_interval is None else poll_interval
@@ -110,12 +121,11 @@ def run_scheduled(
     except (TypeError, ValueError, OverflowError):
         return _finish(4, "SWUDK_POLL_INTERVAL 必须是正整数秒数", emit)
 
-    started = _as_beijing(now())
-    earliest = started.replace(hour=20, minute=40, second=0, microsecond=0)
+    earliest = started.replace(hour=21, minute=0, second=0, microsecond=0)
     first_attempt = started.replace(hour=21, minute=1, second=0, microsecond=0)
     deadline = started.replace(hour=22, minute=55, second=0, microsecond=0)
     if started < earliest or started >= deadline:
-        return _finish(4, "定时任务未在北京时间 20:40–22:55 启动，未提交签到", emit)
+        return _finish(4, "定时任务未在北京时间 21:00–22:55 启动，未提交签到", emit)
 
     emit(f"北京时间 {started:%Y-%m-%d %H:%M:%S} 启动，签到确认截止 {deadline:%H:%M}")
     if started < first_attempt:
@@ -127,7 +137,7 @@ def run_scheduled(
             sleep(min(60, (first_attempt - current).total_seconds()))
 
     child_env["SWUDK_ENFORCE_WINDOW"] = "1"
-    child_env["SWUDK_TARGET_DATE"] = started.strftime("%Y-%m-%d")
+    child_env["SWUDK_TARGET_DATE"] = target_date
     child_env["PYTHONUNBUFFERED"] = "1"
     child_env["SWUDK_DEBUG_CREDENTIALS"] = "0"
     attempt = 0

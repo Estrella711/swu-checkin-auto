@@ -18,5 +18,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: 验证北京时间、提前等待、截止与失败重试
+      - name: 验证实际时间派发、目标日期、截止与失败重试
         run: python -m unittest discover -s tests -v
