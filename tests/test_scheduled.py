@@ -35,12 +35,13 @@ def child(status=1, returncode=0, stdout=None):
 class ScheduledTests(unittest.TestCase):
     def run_scheduler(self, clock, runner, **kwargs):
         self.logs = []
+        env = kwargs.pop("env", {})
         return scheduled.run_scheduled(
-            now=clock.now, sleep=clock.sleep, runner=runner, env={}, emit=self.logs.append, **kwargs
+            now=clock.now, sleep=clock.sleep, runner=runner, env=env, emit=self.logs.append, **kwargs
         )
 
-    def test_warm_start_waits_until_2101_and_forces_window_guard(self):
-        clock = Clock(20, 43)
+    def test_2100_start_waits_until_2101_and_forces_window_guard(self):
+        clock = Clock(21, 0)
         execution_times = []
 
         def runner(command, **kwargs):
@@ -61,7 +62,7 @@ class ScheduledTests(unittest.TestCase):
 
         self.assertEqual(self.run_scheduler(clock, runner), 0)
         self.assertEqual(execution_times, [datetime(2026, 10, 9, 21, 1, tzinfo=scheduled.BEIJING)])
-        self.assertEqual(sum(clock.sleeps), 18 * 60)
+        self.assertEqual(clock.sleeps, [60])
         self.assertEqual(self.logs[-1], "[1] 签到成功")
 
     def test_no_record_and_network_failure_retry_until_confirmed_success(self):
@@ -90,8 +91,48 @@ class ScheduledTests(unittest.TestCase):
                 self.assertEqual(clock.sleeps, [])
                 self.assertTrue(self.logs[-1].startswith("[4] "))
 
+    def test_invalid_target_dates_fail_before_waiting_or_running(self):
+        invalid_dates = (
+            "", "2026-10-9", "2026-1-09", "20261009", "2026-W41-5",
+            " 2026-10-09", "2026-10-09\n", "2026-10-09T00:00:00",
+            "2026-02-30", "0000-10-09", "２０２６-１０-０９", "not-a-date", None,
+        )
+        for target_date in invalid_dates:
+            with self.subTest(target_date=target_date):
+                clock = Clock(21, 0)
+                runner = Mock()
+                self.assertEqual(
+                    self.run_scheduler(clock, runner, env={"SWUDK_TARGET_DATE": target_date}), 1
+                )
+                runner.assert_not_called()
+                self.assertEqual(clock.sleeps, [])
+                self.assertTrue(self.logs[-1].startswith("[4] "))
+                self.assertIn("YYYY-MM-DD", self.logs[-1])
+
+    def test_yesterday_and_tomorrow_target_dates_fail_before_waiting_or_running(self):
+        for target_date in ("2026-10-08", "2026-10-10"):
+            with self.subTest(target_date=target_date):
+                clock = Clock(21, 0)
+                runner = Mock()
+                self.assertEqual(
+                    self.run_scheduler(clock, runner, env={"SWUDK_TARGET_DATE": target_date}), 1
+                )
+                runner.assert_not_called()
+                self.assertEqual(clock.sleeps, [])
+                self.assertTrue(self.logs[-1].startswith("[4] "))
+                self.assertIn("北京时间日期不符", self.logs[-1])
+
+    def test_matching_target_date_is_preserved_without_mutating_original_env(self):
+        clock = Clock()
+        original_env = {"SWUDK_TARGET_DATE": "2026-10-09"}
+        runner = Mock(return_value=child(2))
+        self.assertEqual(self.run_scheduler(clock, runner, env=original_env), 0)
+        self.assertEqual(runner.call_args.kwargs["env"]["SWUDK_TARGET_DATE"], "2026-10-09")
+        self.assertEqual(original_env, {"SWUDK_TARGET_DATE": "2026-10-09"})
+        self.assertEqual(clock.sleeps, [])
+
     def test_early_and_late_starts_fail_instead_of_skipping_green(self):
-        for hour, minute in ((20, 39), (22, 55), (23, 0), (0, 0), (12, 0)):
+        for hour, minute in ((20, 59), (22, 55), (23, 0), (0, 0), (12, 0)):
             with self.subTest(hour=hour, minute=minute):
                 runner = Mock()
                 self.assertEqual(self.run_scheduler(Clock(hour, minute), runner), 1)
@@ -119,8 +160,8 @@ class ScheduledTests(unittest.TestCase):
         self.assertEqual(self.run_scheduler(clock, runner), 1)
         self.assertTrue(self.logs[-1].startswith("[4] "))
 
-    def test_warm_wait_crossing_midnight_keeps_original_deadline(self):
-        clock = Clock(20, 43)
+    def test_first_attempt_wait_crossing_midnight_keeps_original_deadline(self):
+        clock = Clock(21, 0)
         runner = Mock()
 
         def sleep(_seconds):
@@ -140,6 +181,24 @@ class ScheduledTests(unittest.TestCase):
         runner = Mock(return_value=child(2))
         self.assertEqual(self.run_scheduler(clock, runner), 0)
         self.assertEqual(clock.sleeps, [])
+        self.assertEqual(runner.call_args.kwargs["env"]["SWUDK_TARGET_DATE"], "2026-10-09")
+
+    def test_utc_date_boundary_uses_beijing_date_before_window_check(self):
+        for target_date, expected_reason in (
+            ("2026-10-09", "北京时间日期不符"),
+            ("2026-10-10", "21:00–22:55"),
+        ):
+            with self.subTest(target_date=target_date):
+                clock = Clock()
+                clock.current = datetime(2026, 10, 9, 18, 0, tzinfo=timezone.utc)
+                runner = Mock()
+                self.assertEqual(
+                    self.run_scheduler(clock, runner, env={"SWUDK_TARGET_DATE": target_date}), 1
+                )
+                runner.assert_not_called()
+                self.assertEqual(clock.sleeps, [])
+                self.assertTrue(self.logs[-1].startswith("[4] "))
+                self.assertIn(expected_reason, self.logs[-1])
 
     def test_timeout_partial_output_and_missing_results_retry(self):
         clock = Clock()

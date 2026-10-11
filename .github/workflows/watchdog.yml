@@ -1,0 +1,40 @@
+name: SWU定时巡检（不直接打卡）
+
+# 定时事件可以迟到数小时；全天事件流只按实际北京时间判断，不猜固定提前量。
+# 窗外记录是正常巡检，正式签到由另一个工作流承担。
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+      timezone: Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      notify_test:
+        description: '仅测试巡检派发及失败邮件，不调用学校接口'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: 按实际北京时间巡检
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    concurrency:
+      group: swu-checkin-watchdog
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: 核对晚间签到记录并按窗口派发
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          CHECKIN_REF: ${{ github.event.repository.default_branch }}
+          DISPATCH_NOTIFY_TEST: ${{ inputs.notify_test }}
+        run: python -u src/swu_checkin/dispatch.py

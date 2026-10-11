@@ -1,20 +1,10 @@
 name: SWU自动签到01
 
-# 停用方式：仓库 Actions → 自动签到 → Disable workflow
-# GitHub 官方禁用 workflow 后，定时任务和手动触发都会停止
+# 停用自动打卡：禁用“SWU定时巡检（不直接打卡）”。本工作流保留手动入口。
+# 独立巡检按真实北京时间派发，正式自动打卡再次核对日期和 21:00–22:55 窗口。
+run-name: ${{ inputs.notify_test && '邮件通知测试' || inputs.missed_date && format('未签到告警 · {0}', inputs.missed_date) || inputs.scheduled && format('自动查寝 · {0}', inputs.target_date || '手动指定') || github.event_name == 'repository_dispatch' && '自动查寝 · 外部触发' || '手动签到' }}
 
-# 全部计划直接使用北京时间。首次下午启动，容忍已观察到的约 5 小时调度延迟。
-# 下午任务仅等待；自动打卡只在晚上 21:00–23:00 的执行范围内调用学校接口。
 on:
-  schedule:
-    - cron: '43 15 * * *'  # 下午预备，等待到 20:50；正式签到从 21:01 开始
-      timezone: Asia/Shanghai
-    - cron: '17 21 * * *'  # 北京时间 21:17，补跑
-      timezone: Asia/Shanghai
-    - cron: '17 22 * * *'  # 北京时间 22:17，补跑
-      timezone: Asia/Shanghai
-    - cron: '47 22 * * *'  # 北京时间 22:47，补跑
-      timezone: Asia/Shanghai
   repository_dispatch:
     types: [swu-checkin]
   workflow_dispatch:
@@ -27,30 +17,20 @@ on:
         description: '仅测试失败邮件通知，不调用学校接口'
         type: boolean
         default: false
+      target_date:
+        description: '自动打卡目标日期 YYYY-MM-DD（巡检填写；手动留空）'
+        type: string
+        default: ''
+      missed_date:
+        description: '仅通知指定晚间未确认签到，不调用学校接口（巡检填写）'
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
-  prewarm:
-    name: 提前准备（21:00 前不打卡）
-    if: github.event_name == 'schedule' && github.event.schedule == '43 15 * * *'
-    runs-on: ubuntu-latest
-    # 独立任务的上限低于 GitHub 每个执行器任务 6 小时的限制。
-    timeout-minutes: 330
-    outputs:
-      target_date: ${{ steps.wait_window.outputs.target_date }}
-    steps:
-      - name: 检出等待程序
-        uses: actions/checkout@v4
-      - name: 等待到北京时间 20:50
-        id: wait_window
-        run: python -u src/swu_checkin/prewarm.py
-
   checkin:
-    needs: prewarm
-    # 晚间补跑和手动运行跳过 prewarm；预备失败仍进入原邮件通知流程。
-    if: always() && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 180
     strategy:
@@ -76,41 +56,39 @@ jobs:
       cancel-in-progress: false
     
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 检查定时触发窗口
+      - name: 检查实际执行时间与目标日期
         id: schedule_guard
         env:
           EVENT_NAME: ${{ github.event_name }}
-          TRIGGER_CRON: ${{ github.event.schedule }}
           SCHEDULED_INPUT: ${{ inputs.scheduled }}
           NOTIFY_TEST: ${{ inputs.notify_test }}
-          PREWARM_RESULT: ${{ needs.prewarm.result }}
-          PREWARM_TARGET_DATE: ${{ needs.prewarm.outputs.target_date }}
+          INPUT_TARGET_DATE: ${{ inputs.target_date || github.event.client_payload.target_date }}
+          MISSED_DATE: ${{ inputs.missed_date }}
         run: |
           echo "触发方式: $EVENT_NAME"
-          echo "触发 cron: ${TRIGGER_CRON:-手动触发}"
-          echo "当前定时配置时区: Asia/Shanghai"
           echo "执行时间 (北京时间): $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
           allowed=true
           automatic=false
+          target_date=$(TZ='Asia/Shanghai' date '+%Y-%m-%d')
           reason=""
           if [ "$EVENT_NAME" = "schedule" ] || [ "$EVENT_NAME" = "repository_dispatch" ] || [ "$SCHEDULED_INPUT" = "true" ]; then
             automatic=true
             beijing_hhmm=$(TZ='Asia/Shanghai' date '+%H%M')
-            if (( 10#$beijing_hhmm < 2040 || 10#$beijing_hhmm >= 2255 )); then
+            if (( 10#$beijing_hhmm < 2100 || 10#$beijing_hhmm >= 2255 )); then
               allowed=false
-              reason="自动任务启动超出北京时间 20:40–22:55，本次未能确认签到"
+              reason="自动任务实际执行时间超出北京时间 21:00–22:55，本次未提交签到"
+            fi
+            if [ -n "$INPUT_TARGET_DATE" ] && { [[ ! "$INPUT_TARGET_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || [ "$INPUT_TARGET_DATE" != "$target_date" ]; }; then
+              allowed=false
+              reason="自动任务目标日期与实际北京时间日期不一致，未提交签到"
             fi
           fi
-          if [ "$PREWARM_RESULT" = "failure" ]; then
+          if [ -n "$MISSED_DATE" ]; then
             allowed=false
-            reason="提前准备任务失败，本次未能确认签到"
-          fi
-          if [ -n "$PREWARM_TARGET_DATE" ] && [ "$PREWARM_TARGET_DATE" != "$(TZ='Asia/Shanghai' date '+%Y-%m-%d')" ]; then
-            allowed=false
-            reason="提前准备与签到执行不在同一北京时间日期，未提交签到"
+            reason="未签到通知的目标日期无效，未调用学校接口"
+            if [[ "$MISSED_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && python -c 'import os; from datetime import date; date.fromisoformat(os.environ["MISSED_DATE"])' && { [[ "$MISSED_DATE" < "$target_date" ]] || { [ "$MISSED_DATE" = "$target_date" ] && (( 10#$(TZ='Asia/Shanghai' date '+%H%M') >= 2300 )); }; }; then
+              reason="北京时间 $MISSED_DATE 21:00–23:00 内未找到已确认成功的签到运行，仅发送通知"
+            fi
           fi
           if [ "$NOTIFY_TEST" = "true" ]; then
             allowed=false
@@ -118,12 +96,17 @@ jobs:
           fi
           echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
           echo "automatic=$automatic" >> "$GITHUB_OUTPUT"
+          echo "target_date=$target_date" >> "$GITHUB_OUTPUT"
           echo "reason=$reason" >> "$GITHUB_OUTPUT"
           if [ "$allowed" = "false" ]; then
             echo "::warning::$reason"
             echo "### ⚠️ $reason" >> "$GITHUB_STEP_SUMMARY"
           fi
       
+      - name: 检出代码
+        if: steps.schedule_guard.outputs.allowed == 'true'
+        uses: actions/checkout@v4
+
       - name: 设置 Python
         if: steps.schedule_guard.outputs.allowed == 'true'
         timeout-minutes: 10
@@ -157,6 +140,7 @@ jobs:
           # 晚间实际日志出现 ReadTimeout；给任务/宿舍接口 30 秒读取时间。
           SWUDK_REQUEST_TIMEOUT: "30"
           SWUDK_POLL_INTERVAL: "300"
+          SWUDK_TARGET_DATE: ${{ steps.schedule_guard.outputs.target_date }}
           AUTOMATIC: ${{ steps.schedule_guard.outputs.automatic }}
           # 只记录接口状态/耗时/异常类型，不记录查询参数、凭据、请求或响应内容。
           PYTHONPATH: ${{ github.workspace }}/.github/diagnostics
@@ -326,7 +310,7 @@ jobs:
             执行时间：${{ steps.format_time.outputs.beijing_time }} (北京时间)
 
             本次运行未能确认签到成功（先前运行可能已经成功）。
-            定时任务在 21:00–23:00 范围内执行，22:55 停止并预留通知时间；启动迟到或环境准备失败也会通知。
+            正式自动打卡只在北京时间 21:00–22:55 执行；日期不符、执行迟到、准备失败或巡检确认错过晚间窗口时通知。
             完整结果：
             ${{ steps.checkin.outputs.full_result || steps.schedule_guard.outputs.reason || '未取得打卡结果' }}
 
