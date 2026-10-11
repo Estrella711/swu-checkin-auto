@@ -105,6 +105,42 @@ class DecisionTests(unittest.TestCase):
         old = run_record(status="queued", conclusion=None, title="自动查寝 · 2026-10-10", created=at(21, day=10))
         self.assertEqual(dispatch.decide(at(21, 10), [old]).action, "checkin")
 
+    def test_explicit_past_and_future_title_dates_override_tonights_creation(self):
+        for title_date in ("2026-10-10", "2026-10-12"):
+            for status, conclusion in (("completed", "success"), ("completed", "failure"), ("in_progress", None)):
+                with self.subTest(title_date=title_date, status=status, conclusion=conclusion):
+                    stale = run_record(
+                        title=f"自动查寝 · {title_date}", created=at(21, 7), status=status, conclusion=conclusion
+                    )
+                    self.assertEqual(dispatch.decide(at(21, 10), [stale]).action, "checkin")
+                    self.assertEqual(dispatch.decide(at(23), [stale]).action, "missed")
+
+    def test_invalid_explicit_title_date_cannot_fall_back_to_tonights_creation(self):
+        for title_date in ("2026-02-30", "2026-10-1", "bad-date", ""):
+            for status, conclusion in (("completed", "success"), ("completed", "failure"), ("queued", None)):
+                with self.subTest(title_date=title_date, status=status, conclusion=conclusion):
+                    invalid = run_record(title=f"自动查寝 · {title_date}", status=status, conclusion=conclusion)
+                    self.assertEqual(dispatch.decide(at(21, 10), [invalid]).action, "checkin")
+                    self.assertEqual(dispatch.decide(at(23), [invalid]).action, "missed")
+
+    def test_explicit_correct_date_keeps_success_failure_and_active_behavior(self):
+        success = run_record()
+        failed = run_record(conclusion="failure")
+        active = run_record(status="in_progress", conclusion=None)
+        self.assertEqual(dispatch.decide(at(21, 10), [success]).action, "skip")
+        self.assertEqual(dispatch.decide(at(21, 10), [failed]).action, "checkin")
+        self.assertEqual(dispatch.decide(at(21, 10), [active]).action, "skip")
+        for existing in (success, failed, active):
+            with self.subTest(status=existing["status"], conclusion=existing["conclusion"]):
+                self.assertEqual(dispatch.decide(at(23), [existing]).action, "skip")
+
+    def test_generic_automatic_titles_keep_creation_time_compatibility(self):
+        for title in ("自动查寝 · 手动指定", "自动查寝 · 外部触发"):
+            with self.subTest(title=title):
+                self.assertEqual(dispatch.decide(at(21, 10), [run_record(title=title)]).action, "skip")
+                failed = run_record(title=title, conclusion="failure")
+                self.assertEqual(dispatch.decide(at(23), [failed]).action, "skip")
+
     def test_completed_failure_allows_window_retry_and_suppresses_later_notice(self):
         failed = run_record(conclusion="failure")
         self.assertEqual(dispatch.decide(at(21, 10), [failed]).action, "checkin")
@@ -122,6 +158,25 @@ class DecisionTests(unittest.TestCase):
             with self.subTest(status=status, conclusion=conclusion):
                 notice = run_record(status=status, conclusion=conclusion, title="未签到告警 · 2026-10-11", created=at(23))
                 self.assertEqual(dispatch.decide(at(12, day=12), [notice]).action, "skip")
+
+    def test_cancelled_timed_out_or_skipped_notice_can_be_dispatched_again(self):
+        for conclusion in ("cancelled", "timed_out", "skipped", "action_required", "neutral"):
+            with self.subTest(conclusion=conclusion):
+                notice = run_record(title="未签到告警 · 2026-10-11", created=at(23), conclusion=conclusion)
+                self.assertEqual(dispatch.decide(at(12, day=12), [notice]).action, "missed")
+
+    def test_dated_failure_after_window_counts_as_already_attempted_notification(self):
+        late = run_record(created=at(22, 56), conclusion="failure")
+        self.assertEqual(dispatch.decide(at(23), [late]).action, "skip")
+        self.assertEqual(dispatch.decide(at(12, day=12), [late]).action, "skip")
+
+    def test_dated_success_after_window_does_not_confirm_checkin(self):
+        late = run_record(created=at(22, 56))
+        self.assertEqual(dispatch.decide(at(23), [late]).action, "missed")
+
+    def test_legacy_failure_after_window_does_not_claim_tonight_notification(self):
+        late = run_record(title="SWU自动签到01", created=at(22, 56), conclusion="failure")
+        self.assertEqual(dispatch.decide(at(23), [late]).action, "missed")
 
     def test_active_manual_main_in_target_window_suppresses_missed_notice(self):
         active = run_record(status="in_progress", conclusion=None, title="手动签到")
@@ -150,13 +205,14 @@ class OrchestrationTests(unittest.TestCase):
         client.list_runs.return_value = [] if runs is None else runs
         return client
 
-    def invoke(self, client, times=None, notify_test=False):
+    def invoke(self, client, times=None, notify_test=False, expected_date=None):
         self.logs = []
         self.summaries = []
         current = at(21, 10) if times is None else None
         now = (lambda: current) if times is None else Mock(side_effect=times)
         return dispatch.run_dispatch(
-            client=client, now=now, emit=self.logs.append, summary=self.summaries.append, notify_test=notify_test
+            client=client, now=now, emit=self.logs.append, summary=self.summaries.append,
+            notify_test=notify_test, expected_date=expected_date,
         )
 
     def test_dispatch_and_summary_use_actual_date_and_48h_inventory(self):
@@ -179,6 +235,31 @@ class OrchestrationTests(unittest.TestCase):
         client.list_runs.assert_not_called()
         client.dispatch.assert_called_once_with({"scheduled": False, "notify_test": True})
         self.assertEqual(self.summaries, ["dispatch: 派发邮件测试（未调用学校接口）"])
+
+    def test_bootstrap_old_date_never_dispatches_at_next_evening(self):
+        client = self.make_client()
+        self.assertEqual(self.invoke(client, times=[at(21, day=12)], expected_date="2026-10-11"), 0)
+        client.list_runs.assert_not_called()
+        client.dispatch.assert_not_called()
+        self.assertTrue(self.logs[-1].startswith("skip:"))
+
+    def test_bootstrap_expected_evening_allows_checkin(self):
+        client = self.make_client()
+        self.assertEqual(self.invoke(client, expected_date="2026-10-11"), 0)
+        client.dispatch.assert_called_once_with({"scheduled": True, "target_date": "2026-10-11", "notify_test": False})
+
+    def test_bootstrap_late_start_only_alerts_original_evening(self):
+        for current in (at(23), at(2, day=12)):
+            with self.subTest(current=current):
+                client = self.make_client()
+                self.assertEqual(self.invoke(client, times=[current] * 3, expected_date="2026-10-11"), 0)
+                client.dispatch.assert_called_once_with({"missed_date": "2026-10-11"})
+
+    def test_notify_test_ignores_bootstrap_date_bound(self):
+        client = self.make_client()
+        self.assertEqual(self.invoke(client, times=[], notify_test=True, expected_date="2026-10-01"), 0)
+        client.list_runs.assert_not_called()
+        client.dispatch.assert_called_once_with({"scheduled": False, "notify_test": True})
 
     def test_cleanup_skip_needs_no_api_calls(self):
         client = self.make_client()
@@ -318,6 +399,7 @@ class GitHubClientTests(unittest.TestCase):
             "GITHUB_REF_NAME": "feature/watchdog-test",
             "CHECKIN_REF": "main",
             "DISPATCH_NOTIFY_TEST": "true",
+            "DISPATCH_EXPECTED_DATE": "2026-10-11",
         }
         with patch.dict(dispatch.os.environ, environment, clear=True):
             with patch.object(dispatch, "GitHubClient") as client_class:
@@ -325,6 +407,7 @@ class GitHubClientTests(unittest.TestCase):
                     self.assertEqual(dispatch.main(), 0)
         client_class.assert_called_once_with("Estrella711/swu-checkin-auto", "token-from-workflow", ref="main")
         self.assertTrue(run_dispatch.call_args.kwargs["notify_test"])
+        self.assertEqual(run_dispatch.call_args.kwargs["expected_date"], "2026-10-11")
 
     def test_main_dispatches_configured_default_branch_instead_of_triggering_branch(self):
         environment = {
@@ -350,6 +433,18 @@ class GitHubClientTests(unittest.TestCase):
                 with patch.object(dispatch, "run_dispatch", return_value=0):
                     self.assertEqual(dispatch.main(), 0)
         client_class.assert_called_once_with("Estrella711/swu-checkin-auto", "token-from-workflow", ref="main")
+
+    def test_main_empty_expected_date_keeps_normal_pulse_behavior(self):
+        environment = {
+            "GITHUB_REPOSITORY": "Estrella711/swu-checkin-auto",
+            "GITHUB_TOKEN": "token-from-workflow",
+            "DISPATCH_EXPECTED_DATE": " ",
+        }
+        with patch.dict(dispatch.os.environ, environment, clear=True):
+            with patch.object(dispatch, "GitHubClient"):
+                with patch.object(dispatch, "run_dispatch", return_value=0) as run_dispatch:
+                    self.assertEqual(dispatch.main(), 0)
+        self.assertIsNone(run_dispatch.call_args.kwargs["expected_date"])
 
 
 if __name__ == "__main__":

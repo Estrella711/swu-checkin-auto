@@ -8,7 +8,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.client import HTTPException
 from typing import NamedTuple
 from urllib.error import HTTPError, URLError
@@ -75,10 +75,24 @@ def _notification_only(run: Mapping) -> bool:
     return title == "邮件通知测试" or title.startswith("未签到告警 · ")
 
 
+def _automatic_title_date(title: str) -> tuple[bool, str | None]:
+    prefix = "自动查寝 ·"
+    if not title.startswith(prefix) or title in {"自动查寝 · 外部触发", "自动查寝 · 手动指定"}:
+        return False, None
+    value = title[len(prefix):].strip()
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        return True, None
+    try:
+        return True, date.fromisoformat(value).isoformat()
+    except ValueError:
+        return True, None
+
+
 def _automatic_for_date(run: Mapping, target_date: str, created: datetime) -> bool:
     title = _title(run)
-    if title == f"自动查寝 · {target_date}":
-        return True
+    explicit_date, title_date = _automatic_title_date(title)
+    if explicit_date:
+        return title_date == target_date
     if created.date().isoformat() != target_date:
         return False
     return run.get("event") == "schedule" or title in {
@@ -111,8 +125,16 @@ def decide(now: datetime, runs: Sequence[Mapping]) -> Decision:
         created = _created_at(run)
         title = _title(run)
         if title == f"未签到告警 · {target_date}":
-            notice_exists = True
+            notice_exists = notice_exists or run["status"] in ACTIVE_STATUSES or (
+                run["status"] == "completed" and run.get("conclusion") in {"success", "failure"}
+            )
         if _notification_only(run):
+            continue
+
+        # An explicit target date takes precedence over runner creation time.
+        # A stale run created tonight must never stand in for tonight's result.
+        explicit_date, title_date = _automatic_title_date(title)
+        if explicit_date and title_date != target_date:
             continue
 
         created_in_window = target_start <= created < target_end
@@ -120,9 +142,13 @@ def decide(now: datetime, runs: Sequence[Mapping]) -> Decision:
         automatic = _automatic_for_date(run, target_date, created)
         if active and (automatic or created_in_window):
             related_active = True
-        if created_in_window and run["status"] == "completed":
-            confirmed = confirmed or run.get("conclusion") == "success"
-            failed_and_notified = failed_and_notified or run.get("conclusion") == "failure"
+        if run["status"] == "completed":
+            confirmed = confirmed or (created_in_window and run.get("conclusion") == "success")
+            # A correctly dated run that starts too late fails its time guard
+            # and enters the existing failure mail flow; don't send a second mail.
+            failed_and_notified = failed_and_notified or (
+                (created_in_window or explicit_date) and run.get("conclusion") == "failure"
+            )
 
     if confirmed:
         return Decision("skip", target_date, "目标晚间已有签到成功或已签到的主流程")
@@ -219,6 +245,7 @@ def run_dispatch(
     emit: Callable[[str], None] = print,
     summary: Callable[[str], None] | None = None,
     notify_test: bool = False,
+    expected_date: str | None = None,
 ) -> int:
     def report(message: str) -> None:
         emit(message)
@@ -233,6 +260,9 @@ def run_dispatch(
 
         started = _as_beijing(now())
         initial = decide(started, [])
+        if expected_date is not None and initial.target_date != expected_date:
+            report("skip: 准备阶段绑定的目标日期与实际可处理晚间不符，不派发任务")
+            return 0
         if initial.action == "skip":
             report(f"skip: {initial.reason}（{initial.target_date}）")
             return 0
@@ -293,6 +323,7 @@ def main() -> int:
         client=client,
         summary=summary,
         notify_test=os.environ.get("DISPATCH_NOTIFY_TEST", "").lower() == "true",
+        expected_date=os.environ.get("DISPATCH_EXPECTED_DATE", "").strip() or None,
     )
 
 
